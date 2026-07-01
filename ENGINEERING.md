@@ -91,21 +91,26 @@ Reset an axis remainder when movement on that axis changes sign. This avoids car
 
 If `index` is past the end of the table, use the last table value.
 
-## Speed And Sensitivity
+## Speed And Internal Normalization
 
-The tool should support two controls:
+The user-facing control should primarily be:
 
 - `--speed 1..11`: Windows-style pointer speed table selection.
+
+The CLI keeps these debug overrides:
+
 - `--sensitivity FLOAT`: extra linear multiplier applied after the EPP gain.
+- `--input-scale FLOAT`: multiplier applied to packet magnitude before EPP table lookup.
 
 Default values:
 
 ```text
-speed = 6
+speed = 4
 sensitivity = 1.0
+input-scale = 0.08
 ```
 
-The speed table should be the primary control. `sensitivity` is a calibration escape hatch for DPI, display scaling, and personal preference.
+The speed table should be the only normal tuning control. Windows' reference default is `f6`, but local macOS testing currently uses `speed = 4` as the practical default with this HID-driven implementation. `sensitivity = 1.0` preserves the low-speed Windows EPP gain from the selected table. `input-scale = 0.08` normalizes larger modern HID packets into the middle of the `libpointing` table domain without adding a custom low-speed rule. The value is intentionally an internal preset rather than a per-device profile; debug overrides remain available for experiments.
 
 ## CLI Shape
 
@@ -113,21 +118,41 @@ Initial commands:
 
 ```text
 winpointer devices
-winpointer run --speed 6 --sensitivity 1.0
+winpointer doctor [--json]
+winpointer run --dry-run
+winpointer run --shadow --quiet
+winpointer run [--speed 1..11] [--samples N] [--timeout-ms N] [--verbose]
 winpointer status
 winpointer stop
 winpointer kill-switch
 winpointer probe
+winpointer probe --tap hid --summary --quiet
+winpointer probe --tap hid --summary --quiet --json
+winpointer compare-summaries --external FILE --trackpad FILE [--min-samples N] [--min-abs-delta N] [--json]
+winpointer compare-summary-set --external FILE [--external FILE ...] --trackpad FILE [--trackpad FILE ...] [--min-samples N] [--min-abs-delta N] [--json]
+winpointer attribution-probe --field FIELD --external-value VALUE --trackpad-value VALUE [--json]
+winpointer pass-through-probe --confirm PASS_THROUGH_TAP [--json]
+winpointer stage2-gate --summary-set FILE --attribution FILE --pass-through FILE [--json]
+winpointer bench-transform
 ```
 
 Expected behavior:
 
 - `devices` lists candidate pointing devices and marks which ones are protected.
-- `run` starts the foreground CLI daemon by default.
+- `doctor` prints a read-only readiness report covering candidates, permissions, listen-only/active tap creation, attribution gates, and persistence safety. With `--json`, stdout must contain only one final result object.
+- `run` without `--real` remains disabled unless it is a dry-run or shadow run.
+- `run` is the current foreground control path. It reads external mouse IOHID reports, moves the cursor from transformed HID deltas, swallows matching macOS mouse events, posts synthetic session events for dragging, and passes through trackpad/unmatched events unchanged. `--verbose` enables hot-path logs; normal operation is quiet by default.
 - `status` reports the active config if a daemon is running.
 - `stop` stops the daemon if running in background mode later.
 - `kill-switch` force-disables any active event tap or background daemon state owned by this tool.
 - `probe` prints raw mouse deltas and transformed deltas without moving the pointer, useful for tuning and tests.
+- `probe --summary` records CGEvent field stability for external-mouse versus trackpad attribution checks.
+- `compare-summaries` compares two JSON summary captures and reports conservative candidate attribution fields after sample-count and movement-quality gates pass. With `--json`, stdout must contain only one final result object.
+- `compare-summary-set` requires repeated external-mouse and trackpad captures and reports only fields that repeat within each device class while differing between device classes. With `--json`, stdout must contain only one final result object.
+- `attribution-probe` uses a repeatable candidate field for live listen-only classification; it must not transform, suppress, or inject events. With `--json`, stdout must contain only one final result object.
+- `pass-through-probe` uses an active event tap but returns every event unchanged; it must require explicit confirmation and exit by sample count or timeout. With `--json`, stdout must contain only one final result object.
+- `stage2-gate` reads the summary-set, attribution, and pass-through JSON outputs offline for legacy CGEvent-path diagnostics. It must not access HID, create event taps, write settings, or enable default `run`.
+- `bench-transform` measures only the acceleration transform cost; it must not access HID, event taps, or system settings.
 
 Background daemon support can come later. The first version should run in the foreground so it can be closed with `Ctrl-C`.
 
@@ -149,7 +174,7 @@ Avoid:
 The default mode should be foreground-only:
 
 ```text
-winpointer run --speed 6 --sensitivity 1.0
+winpointer run
 ```
 
 Required shutdown paths:
@@ -226,6 +251,8 @@ Start with Path A only if it is good enough for a CLI prototype. If latency is v
 Unit-level checks:
 
 - `speed 6` table lookup matches `libpointing` values.
+- CLI default speed is `4`.
+- CLI default internal normalization uses `input-scale = 0.08`.
 - Integer conversion preserves fractional remainders.
 - Remainders reset on sign change.
 - `--sensitivity` scales output after EPP gain.
@@ -246,6 +273,31 @@ Manual checks:
 - Disabling the daemon restores normal mouse movement.
 - `Ctrl-C` exits immediately and restores normal mouse movement.
 - `kill-switch` disables all tool-owned input hooks.
+
+## Performance Expectations
+
+The intended runtime cost should be small relative to normal desktop input handling.
+
+- The transform is O(1) per mouse report: magnitude, EPP table interpolation, sensitivity multiply, truncation, and remainder bookkeeping.
+- The process should sleep in the run loop when there is no mouse input; it should not poll.
+- Terminal output is not representative of the final runtime path. Use quiet/stat modes when measuring CPU behavior.
+- `doctor` should only perform short read-only checks and must not schedule persistent taps, write HID properties, or start a daemon. With `--json`, the report should be parseable by automation as `kind=doctor-report`.
+- Real pointer-control work must keep per-report processing lightweight and avoid allocating in the hot path where practical.
+
+## Pointer Control Path
+
+The current working path is `run`:
+
+- Reads raw IOHID reports from external mouse candidates only.
+- Applies the `libpointing` Windows EPP table using the selected `--speed`.
+- Moves the cursor immediately from the HID callback to avoid low frame-rate CGEvent delivery.
+- Swallows matching macOS mouse move/drag events so the system pointer speed does not stack with this tool.
+- Posts synthetic session events so window and file dragging remains continuous.
+- Passes through trackpad and unmatched events unchanged.
+- Runs only in the foreground and stops when the user closes it with `Ctrl-C`, process termination, or system shutdown.
+- Avoids system setting writes, daemons, launch agents, login items, drivers, or kernel extensions.
+
+The older CoreGraphics attribution commands (`compare-summary-set`, `attribution-probe`, `pass-through-probe`, `stage2-gate`) remain useful diagnostics, but they are not the recommended control path on the current test machine because CGEvent fields did not provide a safe external-mouse-vs-trackpad discriminator.
 
 ## Non-Goals For The First Version
 

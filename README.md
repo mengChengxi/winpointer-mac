@@ -6,6 +6,28 @@
 
 ## Quick Start / 快速使用
 
+Requirements:
+
+使用前需要：
+
+- macOS 13 or newer.
+- Swift toolchain compatible with `swift-tools-version: 6.2`.
+- Xcode Command Line Tools or Xcode installed.
+- No third-party Swift packages are required.
+
+- macOS 13 或更新版本。
+- 兼容 `swift-tools-version: 6.2` 的 Swift 工具链。
+- 已安装 Xcode Command Line Tools 或 Xcode。
+- 不需要额外安装第三方 Swift 包。
+
+Install Apple's command line tools if `swift` is not available:
+
+如果系统里没有 `swift` 命令，先安装 Apple 命令行工具：
+
+```sh
+xcode-select --install
+```
+
 Build the release binary:
 
 构建 release 版本：

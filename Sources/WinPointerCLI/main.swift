@@ -2018,8 +2018,11 @@ final class HIDOverlayRealRunRunner {
     private let quiet: Bool
     private let candidateIDs: Set<String>
     private let accelerator: PointerAccelerator
-    private let displayBounds: CGRect?
+    private var displayBounds: [CGRect]
+    private var lastDisplayBoundsRefresh: UInt64
     private static let syntheticEventMarker: Int64 = 0x57504D414331
+    private static let cursorResyncThresholdSquared: CGFloat = 64 * 64
+    private static let displayBoundsRefreshInterval: UInt64 = 1_000_000_000
     private var hidReportCount = 0
     private var eventCount = 0
     private var matchedEventCount = 0
@@ -2052,6 +2055,7 @@ final class HIDOverlayRealRunRunner {
         self.quiet = quiet
         self.accelerator = try PointerAccelerator(config: config)
         self.displayBounds = Self.activeDisplayBounds()
+        self.lastDisplayBoundsRefresh = DispatchTime.now().uptimeNanoseconds
         self.candidateIDs = Set(
             DeviceEnumerator.listDevices()
                 .filter(\.isCandidate)
@@ -2193,7 +2197,7 @@ final class HIDOverlayRealRunRunner {
 
         let raw = RawDelta(dx: report.dx, dy: report.dy)
         let transformed = accelerator.transform(raw)
-        let base = virtualCursorPosition ?? currentCursorLocation(fallback: .zero)
+        let base = cursorBaseLocation()
         let target = transformedLocation(base, transformed: transformed)
         if CGWarpMouseCursorPosition(target) != .success {
             warpFailureCount += 1
@@ -2351,6 +2355,44 @@ final class HIDOverlayRealRunRunner {
         CGEvent(source: nil)?.location ?? fallback
     }
 
+    private func cursorBaseLocation() -> CGPoint {
+        let actual = currentCursorLocation(fallback: virtualCursorPosition ?? .zero)
+        refreshDisplayBoundsIfNeeded(force: containingDisplayIndex(for: actual) == nil)
+
+        guard let virtual = virtualCursorPosition else {
+            return actual
+        }
+        if shouldResyncCursor(actual: actual, virtual: virtual) {
+            return actual
+        }
+        return virtual
+    }
+
+    private func shouldResyncCursor(actual: CGPoint, virtual: CGPoint) -> Bool {
+        let actualDisplay = containingDisplayIndex(for: actual)
+        let virtualDisplay = containingDisplayIndex(for: virtual)
+        if let actualDisplay, let virtualDisplay, actualDisplay != virtualDisplay {
+            return true
+        }
+        if actualDisplay != nil && virtualDisplay == nil {
+            return true
+        }
+        return distanceSquared(from: actual, to: virtual) > Self.cursorResyncThresholdSquared
+    }
+
+    private func refreshDisplayBoundsIfNeeded(force: Bool = false) {
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard force || now - lastDisplayBoundsRefresh >= Self.displayBoundsRefreshInterval else {
+            return
+        }
+
+        let refreshed = Self.activeDisplayBounds()
+        if !refreshed.isEmpty {
+            displayBounds = refreshed
+        }
+        lastDisplayBoundsRefresh = now
+    }
+
     private func transformedLocation(_ location: CGPoint, transformed: TransformedDelta) -> CGPoint {
         clampToDisplayBounds(
             CGPoint(
@@ -2361,13 +2403,37 @@ final class HIDOverlayRealRunRunner {
     }
 
     private func clampToDisplayBounds(_ point: CGPoint) -> CGPoint {
-        guard let bounds = displayBounds, bounds.width > 0, bounds.height > 0 else {
+        guard !displayBounds.isEmpty else {
+            return point
+        }
+        if displayBounds.contains(where: { $0.contains(point) }) {
+            return point
+        }
+        return displayBounds
+            .map { bounds in clampedPoint(point, to: bounds) }
+            .min { lhs, rhs in
+                distanceSquared(from: point, to: lhs) < distanceSquared(from: point, to: rhs)
+            } ?? point
+    }
+
+    private func clampedPoint(_ point: CGPoint, to bounds: CGRect) -> CGPoint {
+        guard bounds.width > 0, bounds.height > 0 else {
             return point
         }
         return CGPoint(
             x: min(max(point.x, bounds.minX), bounds.maxX - 1),
             y: min(max(point.y, bounds.minY), bounds.maxY - 1)
         )
+    }
+
+    private func containingDisplayIndex(for point: CGPoint) -> Int? {
+        displayBounds.firstIndex { $0.contains(point) }
+    }
+
+    private func distanceSquared(from lhs: CGPoint, to rhs: CGPoint) -> CGFloat {
+        let dx = lhs.x - rhs.x
+        let dy = lhs.y - rhs.y
+        return dx * dx + dy * dy
     }
 
     private func makeTimeout(runLoop: CFRunLoop) -> CFRunLoopTimer? {
@@ -2422,11 +2488,11 @@ final class HIDOverlayRealRunRunner {
         printFlush("elapsed=\(formatSeconds(elapsed))")
     }
 
-    private static func activeDisplayBounds() -> CGRect? {
+    private static func activeDisplayBounds() -> [CGRect] {
         var displayCount: UInt32 = 0
         guard CGGetActiveDisplayList(0, nil, &displayCount) == .success,
               displayCount > 0 else {
-            return nil
+            return []
         }
 
         var displays = [CGDirectDisplayID](repeating: 0, count: Int(displayCount))
@@ -2434,15 +2500,13 @@ final class HIDOverlayRealRunRunner {
             CGGetActiveDisplayList(displayCount, buffer.baseAddress, &displayCount)
         }
         guard result == .success else {
-            return nil
+            return []
         }
 
-        var combinedBounds: CGRect?
-        for display in displays.prefix(Int(displayCount)) {
-            let bounds = CGDisplayBounds(display)
-            combinedBounds = combinedBounds.map { $0.union(bounds) } ?? bounds
-        }
-        return combinedBounds
+        return displays
+            .prefix(Int(displayCount))
+            .map(CGDisplayBounds)
+            .filter { $0.width > 0 && $0.height > 0 }
     }
 
     private static func deviceID(_ device: IOHIDDevice) -> String {

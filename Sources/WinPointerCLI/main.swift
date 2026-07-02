@@ -620,7 +620,7 @@ private func printDevices(_ devices: [DeviceInfo]) {
         return
     }
 
-    print("STATUS      USAGE      VENDOR PRODUCT LOCATION TRANSPORT PRODUCT")
+    print("STATUS      USAGE              VENDOR PRODUCT LOCATION TRANSPORT PRODUCT")
     for device in devices {
         let status: String
         if device.isCandidate {
@@ -636,7 +636,7 @@ private func printDevices(_ devices: [DeviceInfo]) {
         let location = device.locationID.map(String.init) ?? "-"
         let line = [
             status.padding(toLength: 11, withPad: " ", startingAt: 0),
-            device.usageDescription.padding(toLength: 10, withPad: " ", startingAt: 0),
+            device.usageDescription.padding(toLength: 18, withPad: " ", startingAt: 0),
             vendor.padding(toLength: 6, withPad: " ", startingAt: 0),
             product.padding(toLength: 7, withPad: " ", startingAt: 0),
             location.padding(toLength: 8, withPad: " ", startingAt: 0),
@@ -957,6 +957,7 @@ private func deviceObject(_ device: DeviceInfo) -> [String: Any] {
         "primaryUsagePage": jsonValue(device.primaryUsagePage),
         "primaryUsage": jsonValue(device.primaryUsage),
         "usage": device.usageDescription,
+        "usagePairs": device.usagePairs.map(\.description),
         "isCandidate": device.isCandidate,
         "isProtected": device.isProtected,
         "reason": device.reason,
@@ -2071,11 +2072,7 @@ final class HIDOverlayRealRunRunner {
         let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
         self.manager = manager
 
-        let matching: NSDictionary = [
-            kIOHIDDeviceUsagePageKey: kHIDPage_GenericDesktop,
-            kIOHIDDeviceUsageKey: kHIDUsage_GD_Mouse,
-        ]
-        IOHIDManagerSetDeviceMatching(manager, matching)
+        IOHIDManagerSetDeviceMatching(manager, nil)
 
         let result = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
         guard result == kIOReturnSuccess else {
@@ -2578,11 +2575,7 @@ final class HIDRawProbeRunner {
         let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
         self.manager = manager
 
-        let matching: NSDictionary = [
-            kIOHIDDeviceUsagePageKey: kHIDPage_GenericDesktop,
-            kIOHIDDeviceUsageKey: kHIDUsage_GD_Mouse,
-        ]
-        IOHIDManagerSetDeviceMatching(manager, matching)
+        IOHIDManagerSetDeviceMatching(manager, nil)
 
         let result = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
         guard result == kIOReturnSuccess else {

@@ -1,6 +1,20 @@
 import Foundation
 import IOKit.hid
 
+public struct HIDUsagePair: Equatable, Sendable {
+    public let usagePage: Int
+    public let usage: Int
+
+    public init(usagePage: Int, usage: Int) {
+        self.usagePage = usagePage
+        self.usage = usage
+    }
+
+    public var description: String {
+        String(format: "0x%02X/0x%02X", usagePage, usage)
+    }
+}
+
 public struct DeviceInfo: Equatable, Sendable {
     public let id: String
     public let productName: String
@@ -11,6 +25,7 @@ public struct DeviceInfo: Equatable, Sendable {
     public let locationID: Int?
     public let primaryUsagePage: Int?
     public let primaryUsage: Int?
+    public let usagePairs: [HIDUsagePair]
     public let isCandidate: Bool
     public let isProtected: Bool
     public let reason: String
@@ -19,7 +34,12 @@ public struct DeviceInfo: Equatable, Sendable {
         guard let primaryUsagePage, let primaryUsage else {
             return "-"
         }
-        return String(format: "0x%02X/0x%02X", primaryUsagePage, primaryUsage)
+        let primary = String(format: "0x%02X/0x%02X", primaryUsagePage, primaryUsage)
+        guard let mousePair = usagePairs.first(where: { $0.usagePage == 0x01 && $0.usage == 0x02 }),
+              mousePair.usagePage != primaryUsagePage || mousePair.usage != primaryUsage else {
+            return primary
+        }
+        return "\(primary)+mouse"
     }
 }
 
@@ -35,14 +55,16 @@ public enum DeviceClassifier {
         manufacturer: String,
         transport: String,
         usagePage: Int?,
-        usage: Int?
+        usage: Int?,
+        usagePairs: [HIDUsagePair] = []
     ) -> Result {
         if let protectionReason = protectedReason(
             productName: productName,
             manufacturer: manufacturer,
             transport: transport,
             usagePage: usagePage,
-            usage: usage
+            usage: usage,
+            usagePairs: usagePairs
         ) {
             return Result(isCandidate: false, isProtected: true, reason: protectionReason)
         }
@@ -52,7 +74,8 @@ public enum DeviceClassifier {
             manufacturer: manufacturer,
             transport: transport,
             usagePage: usagePage,
-            usage: usage
+            usage: usage,
+            usagePairs: usagePairs
         )
 
         return Result(
@@ -74,12 +97,18 @@ public enum DeviceClassifier {
         return usagePage == 0x0D
     }
 
+    public static func isPointingDevice(_ usagePage: Int?, _ usage: Int?, usagePairs: [HIDUsagePair]) -> Bool {
+        isPointingUsage(usagePage, usage)
+            || usagePairs.contains { isPointingUsage($0.usagePage, $0.usage) }
+    }
+
     private static func protectedReason(
         productName: String,
         manufacturer: String,
         transport: String,
         usagePage: Int?,
-        usage: Int?
+        usage: Int?,
+        usagePairs: [HIDUsagePair]
     ) -> String? {
         let text = [productName, manufacturer, transport]
             .joined(separator: " ")
@@ -121,9 +150,12 @@ public enum DeviceClassifier {
         manufacturer: String,
         transport: String,
         usagePage: Int?,
-        usage: Int?
+        usage: Int?,
+        usagePairs: [HIDUsagePair]
     ) -> Bool {
-        guard usagePage == 0x01, usage == 0x02 else {
+        let hasMouseUsage = usagePage == 0x01 && usage == 0x02
+            || usagePairs.contains { $0.usagePage == 0x01 && $0.usage == 0x02 }
+        guard hasMouseUsage else {
             return false
         }
 
@@ -153,7 +185,13 @@ public enum DeviceEnumerator {
             .compactMap { $0 as! IOHIDDevice? }
             .map(deviceInfo)
             .filter { info in
-                info.isCandidate || info.isProtected || DeviceClassifier.isPointingUsage(info.primaryUsagePage, info.primaryUsage)
+                info.isCandidate
+                    || info.isProtected
+                    || DeviceClassifier.isPointingDevice(
+                        info.primaryUsagePage,
+                        info.primaryUsage,
+                        usagePairs: info.usagePairs
+                    )
             }
             .sorted { lhs, rhs in
                 lhs.productName.localizedCaseInsensitiveCompare(rhs.productName) == .orderedAscending
@@ -169,6 +207,7 @@ public enum DeviceEnumerator {
         let locationID = intProperty(device, kIOHIDLocationIDKey)
         let usagePage = intProperty(device, kIOHIDPrimaryUsagePageKey)
         let usage = intProperty(device, kIOHIDPrimaryUsageKey)
+        let usagePairs = usagePairsProperty(device)
         let vendorPart = vendorID.map(String.init) ?? "unknown"
         let productPart = productID.map(String.init) ?? "unknown"
         let locationPart = locationID.map(String.init) ?? "unknown"
@@ -179,7 +218,8 @@ public enum DeviceEnumerator {
             manufacturer: manufacturer,
             transport: transport,
             usagePage: usagePage,
-            usage: usage
+            usage: usage,
+            usagePairs: usagePairs
         )
 
         return DeviceInfo(
@@ -192,6 +232,7 @@ public enum DeviceEnumerator {
             locationID: locationID,
             primaryUsagePage: usagePage,
             primaryUsage: usage,
+            usagePairs: usagePairs,
             isCandidate: classification.isCandidate,
             isProtected: classification.isProtected,
             reason: classification.reason
@@ -205,6 +246,30 @@ public enum DeviceEnumerator {
     private static func intProperty(_ device: IOHIDDevice, _ key: String) -> Int? {
         if let number = IOHIDDeviceGetProperty(device, (key as NSString) as CFString) as? NSNumber {
             return number.intValue
+        }
+        return nil
+    }
+
+    private static func usagePairsProperty(_ device: IOHIDDevice) -> [HIDUsagePair] {
+        guard let pairs = IOHIDDeviceGetProperty(device, (kIOHIDDeviceUsagePairsKey as NSString) as CFString) as? [NSDictionary] else {
+            return []
+        }
+
+        return pairs.compactMap { pair in
+            guard let usagePage = intValue(pair[kIOHIDDeviceUsagePageKey]),
+                  let usage = intValue(pair[kIOHIDDeviceUsageKey]) else {
+                return nil
+            }
+            return HIDUsagePair(usagePage: usagePage, usage: usage)
+        }
+    }
+
+    private static func intValue(_ value: Any?) -> Int? {
+        if let number = value as? NSNumber {
+            return number.intValue
+        }
+        if let int = value as? Int {
+            return int
         }
         return nil
     }
